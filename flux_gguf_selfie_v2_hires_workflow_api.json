@@ -1,0 +1,142 @@
+{
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "flux1-dev-Q5_K_S.gguf"
+    }
+  },
+  "11": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "lora_name": "boreal-v2.safetensors",
+      "strength_model": 0.65
+    }
+  },
+  "2": {
+    "class_type": "DualCLIPLoaderGGUF",
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "t5-v1_1-xxl-encoder-Q5_K_M.gguf",
+      "type": "flux"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "phone photo, close-up front camera selfie of a 24-year-old Costa Rican woman sitting in the passenger seat of a car, phone held slightly above at arm's length, head slightly tilted, face filling most of the frame. Long straight black hair, slightly messy, with flyaway strands over her shoulders. Raw unfiltered skin: visible pores on her nose and cheeks, fine peach fuzz on her cheeks catching the light, uneven skin tone, slight redness around her nose, a few tiny blemishes, oily shine on her nose and forehead, rosy flushed cheeks. Pink tinted lip balm with slightly dry lips. She wears a matching pair of small gold hoop earrings, one in each ear. Soft closed-mouth smile, relaxed eyes looking into the camera. Light gray ribbed tank top. Through the car window behind her: a rural road in Costa Rica with banana plants and a small colorful house. Warm afternoon daylight from the window on one side of her face, the other side in shadow. iPhone front camera, slight wide-angle distortion, sharp detail on her face, natural sensor noise, unedited, no beauty filter. instagram photo from 2023.",
+      "clip": [
+        "2",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "FluxGuidance",
+    "inputs": {
+      "conditioning": [
+        "4",
+        0
+      ],
+      "guidance": 2.0
+    }
+  },
+  "6": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": {
+      "conditioning": [
+        "4",
+        0
+      ]
+    }
+  },
+  "8": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "11",
+        0
+      ],
+      "positive": [
+        "5",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ],
+      "latent_image": [
+        "22",
+        0
+      ],
+      "seed": 0,
+      "steps": 25,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 0.35
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "8",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "10": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "9",
+        0
+      ],
+      "filename_prefix": "flux_gguf_selfie_v2_hires"
+    }
+  },
+  "20": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "flux_gguf_selfie_v2_seed2430763380.png"
+    }
+  },
+  "21": {
+    "class_type": "ImageScaleBy",
+    "inputs": {
+      "image": [
+        "20",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "scale_by": 1.5
+    }
+  },
+  "22": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "21",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  }
+}

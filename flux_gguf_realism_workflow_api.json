@@ -1,0 +1,64 @@
+{
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": { "unet_name": "flux1-dev-Q5_K_S.gguf" }
+  },
+  "11": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": { "model": ["1", 0], "lora_name": "boreal-v2.safetensors", "strength_model": 0.7 }
+  },
+  "2": {
+    "class_type": "DualCLIPLoaderGGUF",
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "t5-v1_1-xxl-encoder-Q5_K_M.gguf",
+      "type": "flux"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": { "vae_name": "ae.safetensors" }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "phone photo, front camera selfie taken at arm's length by a 24-year-old Costa Rican woman, mestiza, light-brown skin with visible pores, a few small acne marks, light freckles, slight dark circles under her eyes and a slightly oily forehead. Thick dark wavy hair, frizzy from the humidity, tied in a loose messy bun with strands falling across her face. No makeup, slightly uneven eyebrows, small half-smile, relaxed tired expression. Plain faded t-shirt. She is sitting at a white plastic table inside a small roadside soda in Guápiles, Costa Rica, with a hand-written menu board, a drinks fridge and potted tropical plants behind her, and light rain falling on the wet road outside. Overcast gray daylight, flat dull lighting, slightly underexposed, deep depth of field with the background as sharp as her face. Slightly tilted framing, her face off-center, the top of her head cut off by the frame. Cheap phone camera, grainy sensor noise, slight motion blur, washed-out colors, jpeg compression. Unedited photo posted to instagram stories in 2019. flickr photo.",
+      "clip": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "FluxGuidance",
+    "inputs": { "conditioning": ["4", 0], "guidance": 2.2 }
+  },
+  "6": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": { "conditioning": ["4", 0] }
+  },
+  "7": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": { "width": 896, "height": 1152, "batch_size": 1 }
+  },
+  "8": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["11", 0],
+      "positive": ["5", 0],
+      "negative": ["6", 0],
+      "latent_image": ["7", 0],
+      "seed": 0,
+      "steps": 25,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["8", 0], "vae": ["3", 0] }
+  },
+  "10": {
+    "class_type": "SaveImage",
+    "inputs": { "images": ["9", 0], "filename_prefix": "flux_gguf_realism" }
+  }
+}
