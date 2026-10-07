@@ -25,7 +25,11 @@ def api(path, payload=None):
 def run_one(workflow, seed):
     wf = json.loads(workflow.read_text())
     prefix = wf["10"]["inputs"]["filename_prefix"]
-    wf["8"]["inputs"]["seed"] = seed
+    # KSampler takes "seed"; RandomNoise (custom sampling) takes "noise_seed".
+    for node in wf.values():
+        for key in ("seed", "noise_seed"):
+            if key in node["inputs"]:
+                node["inputs"][key] = seed
     wf["10"]["inputs"]["filename_prefix"] = f"{prefix}_{seed}"
 
     t0 = time.time()

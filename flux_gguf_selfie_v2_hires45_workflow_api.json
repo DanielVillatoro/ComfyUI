@@ -83,7 +83,7 @@
       "cfg": 1.0,
       "sampler_name": "euler",
       "scheduler": "simple",
-      "denoise": 0.35
+      "denoise": 0.45
     }
   },
   "9": {
@@ -106,7 +106,7 @@
         "9",
         0
       ],
-      "filename_prefix": "flux_gguf_selfie_v2_hires"
+      "filename_prefix": "flux_gguf_selfie_v2_hires45"
     }
   },
   "20": {

@@ -50,40 +50,29 @@
       "guidance": 2.0
     }
   },
-  "6": {
-    "class_type": "ConditioningZeroOut",
-    "inputs": {
-      "conditioning": [
-        "4",
-        0
-      ]
-    }
-  },
   "8": {
-    "class_type": "KSampler",
+    "class_type": "SamplerCustomAdvanced",
     "inputs": {
-      "model": [
-        "11",
+      "noise": [
+        "34",
         0
       ],
-      "positive": [
-        "5",
+      "guider": [
+        "33",
         0
       ],
-      "negative": [
-        "6",
+      "sampler": [
+        "31",
+        0
+      ],
+      "sigmas": [
+        "32",
         0
       ],
       "latent_image": [
         "22",
         0
-      ],
-      "seed": 0,
-      "steps": 10,
-      "cfg": 1.0,
-      "sampler_name": "euler",
-      "scheduler": "simple",
-      "denoise": 0.35
+      ]
     }
   },
   "9": {
@@ -106,7 +95,7 @@
         "9",
         0
       ],
-      "filename_prefix": "flux_gguf_selfie_v2_hires"
+      "filename_prefix": "flux_gguf_selfie_v2_hires45_dd"
     }
   },
   "20": {
@@ -137,6 +126,62 @@
         "3",
         0
       ]
+    }
+  },
+  "30": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "31": {
+    "class_type": "DetailDaemonSamplerNode",
+    "inputs": {
+      "sampler": [
+        "30",
+        0
+      ],
+      "detail_amount": 1.0,
+      "start": 0.0,
+      "end": 0.9,
+      "bias": 0.5,
+      "exponent": 0.25,
+      "start_offset": 0.0,
+      "end_offset": 0.0,
+      "fade": 0.0,
+      "smooth": true,
+      "cfg_scale_override": 0.0
+    }
+  },
+  "32": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": [
+        "11",
+        0
+      ],
+      "scheduler": "simple",
+      "steps": 10,
+      "denoise": 0.45
+    }
+  },
+  "33": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": [
+        "11",
+        0
+      ],
+      "conditioning": [
+        "5",
+        0
+      ]
+    }
+  },
+  "34": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 0
     }
   }
 }
