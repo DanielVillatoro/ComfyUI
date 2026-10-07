@@ -1,5 +1,6 @@
+import sys
 import torch
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
 # Mock nodes module to prevent CUDA initialization during import
 mock_nodes = MagicMock()
@@ -8,8 +9,19 @@ mock_nodes.MAX_RESOLUTION = 16384
 # Mock server module for PromptServer
 mock_server = MagicMock()
 
-with patch.dict('sys.modules', {'nodes': mock_nodes, 'server': mock_server}):
-    from comfy_extras.nodes_images import ImageStitch
+previous_nodes = sys.modules.get("nodes")
+previous_server = sys.modules.get("server")
+sys.modules["nodes"] = mock_nodes
+sys.modules["server"] = mock_server
+from comfy_extras.nodes_images import ImageStitch
+if previous_nodes is None:
+    sys.modules.pop("nodes")
+else:
+    sys.modules["nodes"] = previous_nodes
+if previous_server is None:
+    sys.modules.pop("server")
+else:
+    sys.modules["server"] = previous_server
 
 
 class TestImageStitch:
@@ -25,7 +37,7 @@ class TestImageStitch:
 
         result = node.stitch(image1, "right", True, 0, "white", image2=None)
 
-        assert len(result) == 1
+        assert len(result.result) == 1
         assert torch.equal(result[0], image1)
 
     def test_basic_horizontal_stitch_right(self):
@@ -240,4 +252,3 @@ class TestImageStitch:
         expected_image2_width = int(64 * (32/32))  # Resized to height 64
         expected_total_width = 48 + 8 + expected_image2_width
         assert result[0].shape[2] == expected_total_width
-

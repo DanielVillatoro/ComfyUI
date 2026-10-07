@@ -1,11 +1,23 @@
+import errno
 import os
 import sys
 import asyncio
 import traceback
+import time
 
 import nodes
 import folder_paths
 import execution
+from comfy_execution.jobs import (
+    JobStatus,
+    get_job,
+    get_all_jobs,
+    get_job_create_times,
+    validate_job_id,
+    cancel_job,
+    CANCEL_PENDING,
+    CANCEL_RUNNING,
+)
 import uuid
 import urllib
 import json
@@ -24,24 +36,80 @@ import logging
 
 import mimetypes
 from comfy.cli_args import args
+from comfy.deploy_environment import get_deploy_environment
 import comfy.utils
 import comfy.model_management
 from comfy_api import feature_flags
+from comfy.comfy_api_env import get_environment_overrides
 import node_helpers
 from comfyui_version import __version__
-from app.frontend_management import FrontendManager
+from app.frontend_management import FrontendManager, parse_version
 from comfy_api.internal import _ComfyNodeInternal
+from app.assets.event_log import emit
+from app.database.db import dependencies_available
+
+if dependencies_available():
+    from app.assets.services.asset_management import (
+        get_export_file,
+        list_job_export_files,
+        resolve_hash_to_path,
+    )
+    from app.asset_export import AssetExportManager
 
 from app.user_manager import UserManager
 from app.model_manager import ModelFileManager
 from app.custom_node_manager import CustomNodeManager
 from app.subgraph_manager import SubgraphManager
-from typing import Optional, Union
+from app.node_replace_manager import NodeReplaceManager
+from typing import TYPE_CHECKING, Optional, Union
 from api_server.routes.internal.internal_routes import InternalRoutes
 from protocol import BinaryEventTypes
 
+if TYPE_CHECKING:
+    from app.assets.manager import AssetManager
+
 # Import cache control middleware
 from middleware.cache_middleware import cache_control
+
+if args.enable_manager:
+    import comfyui_manager
+
+
+def valid_workflow_metadata(json_data: dict) -> Optional[dict]:
+    """The metadata a client may attach to a prompt's websocket messages.
+
+    Returns None when absent, not a dict, or over 256 bytes serialised. The
+    value is merged into outgoing messages, so it is validated here rather
+    than at the point of use.
+    """
+    metadata = json_data.get("workflow_metadata")
+    if isinstance(metadata, dict) and len(json.dumps(metadata)) <= 256:
+        return metadata
+    return None
+
+
+def workflow_metadata_from_prompt(extra_data: dict) -> Optional[dict]:
+    """Fallback for a client that sends a workflow but no explicit metadata.
+
+    Reads the same id /api/jobs reports, so the websocket messages of a prompt
+    carry it whether or not the client knows about workflow_metadata.
+    """
+    extra_pnginfo = extra_data.get("extra_pnginfo")
+    if not isinstance(extra_pnginfo, dict):
+        return None
+    workflow = extra_pnginfo.get("workflow")
+    if not isinstance(workflow, dict):
+        return None
+    workflow_id = workflow.get("id")
+    if isinstance(workflow_id, str) and workflow_id:
+        return valid_workflow_metadata({"workflow_metadata": {"workflow_id": workflow_id}})
+    return None
+
+
+def _remove_sensitive_from_queue(queue: list) -> list:
+    """Remove sensitive data (index 5) from queue item tuples."""
+    return [item[:5] for item in queue]
+
 
 async def send_socket_catch_exception(function, message):
     try:
@@ -94,12 +162,13 @@ def create_cors_middleware(allowed_origin: str):
             response = await handler(request)
 
         response.headers['Access-Control-Allow-Origin'] = allowed_origin
-        response.headers['Access-Control-Allow-Methods'] = 'POST, GET, DELETE, PUT, OPTIONS'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, GET, DELETE, PUT, OPTIONS, PATCH'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
         response.headers['Access-Control-Allow-Credentials'] = 'true'
         return response
 
     return cors_middleware
+
 
 def is_loopback(host):
     if host is None:
@@ -130,6 +199,10 @@ def is_loopback(host):
 def create_origin_only_middleware():
     @web.middleware
     async def origin_only_middleware(request: web.Request, handler):
+        if 'Sec-Fetch-Site' in request.headers:
+            sec_fetch_site = request.headers['Sec-Fetch-Site']
+            if sec_fetch_site == 'cross-site':
+                return web.Response(status=403)
         #this code is used to prevent the case where a random website can queue comfy workflows by making a POST to 127.0.0.1 which browsers don't prevent for some dumb reason.
         #in that case the Host and Origin hostnames won't match
         #I know the proper fix would be to add a cookie but this should take care of the problem in the meantime
@@ -163,18 +236,32 @@ def create_origin_only_middleware():
 
     return origin_only_middleware
 
+
+def create_block_external_middleware():
+    @web.middleware
+    async def block_external_middleware(request: web.Request, handler):
+        if request.method == "OPTIONS":
+            # Pre-flight request. Reply successfully:
+            response = web.Response()
+        else:
+            response = await handler(request)
+
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self'; connect-src 'self' data: blob:; frame-src 'self'; object-src 'self';"
+        return response
+
+    return block_external_middleware
+
+
 class PromptServer():
-    def __init__(self, loop):
+    def __init__(self, loop, asset_manager: "AssetManager"):
         PromptServer.instance = self
 
-        mimetypes.init()
-        mimetypes.add_type('application/javascript; charset=utf-8', '.js')
-        mimetypes.add_type('image/webp', '.webp')
-
+        self.asset_manager = asset_manager
         self.user_manager = UserManager()
         self.model_file_manager = ModelFileManager()
         self.custom_node_manager = CustomNodeManager()
         self.subgraph_manager = SubgraphManager()
+        self.node_replace_manager = NodeReplaceManager()
         self.internal_routes = InternalRoutes(self)
         self.supports = ["custom_nodes_from_web"]
         self.prompt_queue = execution.PromptQueue(self)
@@ -192,6 +279,12 @@ class PromptServer():
         else:
             middlewares.append(create_origin_only_middleware())
 
+        if args.offline:
+            middlewares.append(create_block_external_middleware())
+
+        if args.enable_manager:
+            middlewares.append(comfyui_manager.create_middleware())
+
         max_upload_size = round(args.max_upload_size * 1024 * 1024)
         self.app = web.Application(client_max_size=max_upload_size, middlewares=middlewares)
         self.sockets = dict()
@@ -202,10 +295,35 @@ class PromptServer():
             else args.front_end_root
         )
         logging.info(f"[Prompt Server] web root: {self.web_root}")
+        self.asset_manager.register_routes(self.app, self.user_manager)
+        self.asset_manager.set_event_sink(self.send_sync)
+
+        def _job_create_times(prompt_ids):
+            """Creation times of the given jobs, from the queue and history."""
+            running, queued = self.prompt_queue.get_current_queue_volatile()
+            history = {}
+            for prompt_id in prompt_ids:
+                history.update(
+                    self.prompt_queue.get_history(prompt_id=prompt_id, map_function=lambda item: item)
+                )
+            return get_job_create_times(prompt_ids, running, queued, history)
+
+        if dependencies_available():
+            self.asset_export_manager = AssetExportManager(
+                list_job_files=list_job_export_files,
+                get_asset_file=get_export_file,
+                get_job_create_times=_job_create_times,
+                event_sink=self.send_sync,
+                get_user_id=self.user_manager.get_request_user_id,
+            )
+            self.asset_export_manager.register_routes(self.app)
+        if self.asset_manager.enabled:
+            emit("assets.enabled", hashing_enabled=args.enable_asset_hashing)
         routes = web.RouteTableDef()
         self.routes = routes
         self.last_node_id = None
         self.client_id = None
+        self.workflow_metadata = {}
 
         self.on_prompt_handlers = []
 
@@ -272,7 +390,7 @@ class PromptServer():
         @routes.get("/")
         async def get_root(request):
             response = web.FileResponse(os.path.join(self.web_root, "index.html"))
-            response.headers['Cache-Control'] = 'no-cache'
+            response.headers['Cache-Control'] = 'no-store, must-revalidate'
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
             return response
@@ -291,7 +409,7 @@ class PromptServer():
         @routes.get("/models/{folder}")
         async def get_models(request):
             folder = request.match_info.get("folder", None)
-            if not folder in folder_paths.folder_names_and_paths:
+            if folder not in folder_paths.folder_names_and_paths:
                 return web.Response(status=404)
             files = folder_paths.get_filename_list(folder)
             return web.json_response(files)
@@ -381,7 +499,26 @@ class PromptServer():
                         with open(filepath, "wb") as f:
                             f.write(image.file.read())
 
-                return web.json_response({"name" : filename, "subfolder": subfolder, "type": image_upload_type})
+                resp = {"name" : filename, "subfolder": subfolder, "type": image_upload_type}
+
+                view = self.asset_manager.register_upload(
+                    abs_path=filepath,
+                    name=filename,
+                    upload_type=image_upload_type,
+                    subfolder=subfolder,
+                    content_written=not image_is_duplicate,
+                )
+                if view is not None:
+                    resp["asset"] = {
+                        "id": view.asset.id,
+                        "name": view.asset.name,
+                        "asset_hash": view.asset_hash,
+                        "size": view.size,
+                        "mime_type": view.mime_type,
+                        "tags": view.tags,
+                    }
+
+                return web.json_response(resp)
             else:
                 return web.Response(status=400)
 
@@ -441,30 +578,48 @@ class PromptServer():
         async def view_image(request):
             if "filename" in request.rel_url.query:
                 filename = request.rel_url.query["filename"]
-                filename, output_dir = folder_paths.annotated_filepath(filename)
 
-                if not filename:
-                    return web.Response(status=400)
+                # The frontend's LoadImage combo widget uses asset_hash values
+                # (e.g. "blake3:...") as widget values. When litegraph renders the
+                # node preview, it constructs /view?filename=<asset_hash>, so this
+                # endpoint must resolve blake3 hashes to their on-disk file paths.
+                if filename.startswith("blake3:"):
+                    if not self.asset_manager.enabled:
+                        return web.Response(status=404)
+                    # Side-effect call: get_request_user_id raises KeyError for an unknown or
+                    # system user in multi-user mode, which is what gates hash resolution.
+                    # The returned id is deliberately unused (resolution is not owner-scoped).
+                    self.user_manager.get_request_user_id(request)
+                    result = resolve_hash_to_path(filename)
+                    if result is None:
+                        return web.Response(status=404)
+                    file, filename, resolved_content_type = result.abs_path, result.download_name, result.content_type
+                else:
+                    resolved_content_type = None
+                    filename, output_dir = folder_paths.annotated_filepath(filename)
 
-                # validation for security: prevent accessing arbitrary path
-                if filename[0] == '/' or '..' in filename:
-                    return web.Response(status=400)
+                    if not filename:
+                        return web.Response(status=400)
 
-                if output_dir is None:
-                    type = request.rel_url.query.get("type", "output")
-                    output_dir = folder_paths.get_directory_by_type(type)
+                    # validation for security: prevent accessing arbitrary path
+                    if filename[0] == '/' or '..' in filename:
+                        return web.Response(status=400)
 
-                if output_dir is None:
-                    return web.Response(status=400)
+                    if output_dir is None:
+                        type = request.rel_url.query.get("type", "output")
+                        output_dir = folder_paths.get_directory_by_type(type)
 
-                if "subfolder" in request.rel_url.query:
-                    full_output_dir = os.path.join(output_dir, request.rel_url.query["subfolder"])
-                    if os.path.commonpath((os.path.abspath(full_output_dir), output_dir)) != output_dir:
-                        return web.Response(status=403)
-                    output_dir = full_output_dir
+                    if output_dir is None:
+                        return web.Response(status=400)
 
-                filename = os.path.basename(filename)
-                file = os.path.join(output_dir, filename)
+                    if "subfolder" in request.rel_url.query:
+                        full_output_dir = os.path.join(output_dir, request.rel_url.query["subfolder"])
+                        if os.path.commonpath((os.path.abspath(full_output_dir), output_dir)) != output_dir:
+                            return web.Response(status=403)
+                        output_dir = full_output_dir
+
+                    filename = os.path.basename(filename)
+                    file = os.path.join(output_dir, filename)
 
                 if os.path.isfile(file):
                     if 'preview' in request.rel_url.query:
@@ -524,20 +679,50 @@ class PromptServer():
                             return web.Response(body=alpha_buffer.read(), content_type='image/png',
                                                 headers={"Content-Disposition": f"filename=\"{filename}\""})
                     else:
-                        # Get content type from mimetype, defaulting to 'application/octet-stream'
-                        content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-
-                        # For security, force certain mimetypes to download instead of display
-                        if content_type in {'text/html', 'text/html-sandboxed', 'application/xhtml+xml', 'text/javascript', 'text/css'}:
-                            content_type = 'application/octet-stream'  # Forces download
-
-                        return web.FileResponse(
-                            file,
-                            headers={
-                                "Content-Disposition": f"filename=\"{filename}\"",
-                                "Content-Type": content_type
-                            }
+                        # Use the content type from asset resolution if available,
+                        # otherwise guess from the filename.
+                        content_type = (
+                            resolved_content_type
+                            or mimetypes.guess_type(filename)[0]
+                            or 'application/octet-stream'
                         )
+
+                        # For security, force renderable/active types (HTML, JS,
+                        # CSS, SVG, XML — anything that can carry inline <script>
+                        # and execute in the page origin) to download instead of
+                        # displaying inline, preventing stored XSS. SVG loaded
+                        # into an <img> is exempt, see renders_safely_as_image.
+                        # The attachment disposition is the load-bearing guard: a
+                        # bare filename= hint does not force a download per
+                        # RFC 6266, so we only attach it on the dangerous branch
+                        # to avoid breaking inline display of legitimate images.
+                        # Escape backslash/quote per RFC 6266 quoted-string so a
+                        # filename containing a double quote (which passes the
+                        # ".."/leading-slash filter above) can't break out of the
+                        # header's quoted-string and malform the disposition.
+                        safe_filename = filename.replace("\\", "\\\\").replace('"', '\\"')
+                        disposition = f"filename=\"{safe_filename}\""
+                        headers = {"X-Content-Type-Options": "nosniff"}
+                        sec_fetch_dest = request.headers.get('Sec-Fetch-Dest')
+                        if folder_paths.is_dangerous_content_type(content_type):
+                            # This response now depends on a request header, so
+                            # it must not be reused across destinations.
+                            # FileResponse emits Last-Modified/ETag and nothing
+                            # sets Cache-Control on /view, which makes it
+                            # heuristically cacheable: without these headers a
+                            # cache could replay the inline SVG served to an
+                            # <img> to a later document navigation of the same
+                            # URL and re-enable the stored XSS, or replay the
+                            # attachment to an <img> and re-break the preview.
+                            headers["Vary"] = "Sec-Fetch-Dest"
+                            headers["Cache-Control"] = "no-store"
+                            if not folder_paths.renders_safely_as_image(content_type, sec_fetch_dest):
+                                content_type = 'application/octet-stream'
+                                disposition = f"attachment; filename=\"{safe_filename}\""
+
+                        headers["Content-Disposition"] = disposition
+                        headers["Content-Type"] = content_type
+                        return web.FileResponse(file, headers=headers)
 
             return web.Response(status=404)
 
@@ -546,7 +731,7 @@ class PromptServer():
             folder_name = request.match_info.get("folder_name", None)
             if folder_name is None:
                 return web.Response(status=404)
-            if not "filename" in request.rel_url.query:
+            if "filename" not in request.rel_url.query:
                 return web.Response(status=404)
 
             filename = request.rel_url.query["filename"]
@@ -560,54 +745,70 @@ class PromptServer():
             if out is None:
                 return web.Response(status=404)
             dt = json.loads(out)
-            if not "__metadata__" in dt:
+            if "__metadata__" not in dt:
                 return web.Response(status=404)
             return web.json_response(dt["__metadata__"])
 
         @routes.get("/system_stats")
         async def system_stats(request):
-            device = comfy.model_management.get_torch_device()
-            device_name = comfy.model_management.get_torch_device_name(device)
+            primary_device = comfy.model_management.get_torch_device()
             cpu_device = comfy.model_management.torch.device("cpu")
             ram_total = comfy.model_management.get_total_memory(cpu_device)
             ram_free = comfy.model_management.get_free_memory(cpu_device)
-            vram_total, torch_vram_total = comfy.model_management.get_total_memory(device, torch_total_too=True)
-            vram_free, torch_vram_free = comfy.model_management.get_free_memory(device, torch_free_too=True)
             required_frontend_version = FrontendManager.get_required_frontend_version()
             installed_templates_version = FrontendManager.get_installed_templates_version()
             required_templates_version = FrontendManager.get_required_templates_version()
+            comfy_package_versions = FrontendManager.get_comfy_package_versions()
+
+            # Report every torch device visible to multigpu, with the primary
+            # device first so existing clients that read devices[0] keep working.
+            torch_devices = comfy.model_management.get_all_torch_devices()
+            if primary_device in torch_devices:
+                torch_devices = [primary_device] + [d for d in torch_devices if d != primary_device]
+            else:
+                torch_devices = [primary_device] + list(torch_devices)
+
+            device_entries = []
+            for d in torch_devices:
+                vram_total, torch_vram_total = comfy.model_management.get_total_memory(d, torch_total_too=True)
+                vram_free, torch_vram_free = comfy.model_management.get_free_memory(d, torch_free_too=True)
+                device_entries.append({
+                    "name": comfy.model_management.get_torch_device_name(d),
+                    "type": d.type,
+                    "index": d.index,
+                    "vram_total": vram_total,
+                    "vram_free": vram_free,
+                    "torch_vram_total": torch_vram_total,
+                    "torch_vram_free": torch_vram_free,
+                })
 
             system_stats = {
                 "system": {
-                    "os": os.name,
+                    "os": sys.platform,
                     "ram_total": ram_total,
                     "ram_free": ram_free,
                     "comfyui_version": __version__,
                     "required_frontend_version": required_frontend_version,
                     "installed_templates_version": installed_templates_version,
                     "required_templates_version": required_templates_version,
+                    "comfy_package_versions": comfy_package_versions,
                     "python_version": sys.version,
                     "pytorch_version": comfy.model_management.torch_version,
                     "embedded_python": os.path.split(os.path.split(sys.executable)[0])[1] == "python_embeded",
+                    "deploy_environment": get_deploy_environment(),
                     "argv": sys.argv
                 },
-                "devices": [
-                    {
-                        "name": device_name,
-                        "type": device.type,
-                        "index": device.index,
-                        "vram_total": vram_total,
-                        "vram_free": vram_free,
-                        "torch_vram_total": torch_vram_total,
-                        "torch_vram_free": torch_vram_free,
-                    }
-                ]
+                "devices": device_entries
             }
             return web.json_response(system_stats)
 
         @routes.get("/features")
         async def get_features(request):
-            return web.json_response(feature_flags.get_server_features())
+            features = feature_flags.get_server_features()
+            overrides = get_environment_overrides()
+            if overrides:
+                features.update(overrides)
+            return web.json_response(features)
 
         @routes.get("/prompt")
         async def get_prompt(request):
@@ -620,6 +821,7 @@ class PromptServer():
             info = {}
             info['input'] = obj_class.INPUT_TYPES()
             info['input_order'] = {key: list(value.keys()) for (key, value) in obj_class.INPUT_TYPES().items()}
+            info['is_input_list'] = getattr(obj_class, "INPUT_IS_LIST", False)
             info['output'] = obj_class.RETURN_TYPES
             info['output_is_list'] = obj_class.OUTPUT_IS_LIST if hasattr(obj_class, 'OUTPUT_IS_LIST') else [False] * len(obj_class.RETURN_TYPES)
             info['output_name'] = obj_class.RETURN_NAMES if hasattr(obj_class, 'RETURN_NAMES') else info['output']
@@ -633,6 +835,11 @@ class PromptServer():
             else:
                 info['output_node'] = False
 
+            if hasattr(obj_class, 'HAS_INTERMEDIATE_OUTPUT') and obj_class.HAS_INTERMEDIATE_OUTPUT == True:
+                info['has_intermediate_output'] = True
+            else:
+                info['has_intermediate_output'] = False
+
             if hasattr(obj_class, 'CATEGORY'):
                 info['category'] = obj_class.CATEGORY
 
@@ -643,13 +850,22 @@ class PromptServer():
                 info['deprecated'] = True
             if getattr(obj_class, "EXPERIMENTAL", False):
                 info['experimental'] = True
+            if getattr(obj_class, "DEV_ONLY", False):
+                info['dev_only'] = True
 
             if hasattr(obj_class, 'API_NODE'):
                 info['api_node'] = obj_class.API_NODE
+
+            info['search_aliases'] = getattr(obj_class, 'SEARCH_ALIASES', [])
+
+            if hasattr(obj_class, 'ESSENTIALS_CATEGORY'):
+                info['essentials_category'] = obj_class.ESSENTIALS_CATEGORY
+
             return info
 
         @routes.get("/object_info")
         async def get_object_info(request):
+            self.asset_manager.ensure_scan_started()
             with folder_paths.cache_helper:
                 out = {}
                 for x in nodes.NODE_CLASS_MAPPINGS:
@@ -667,6 +883,230 @@ class PromptServer():
             if (node_class is not None) and (node_class in nodes.NODE_CLASS_MAPPINGS):
                 out[node_class] = node_info(node_class)
             return web.json_response(out)
+
+        @routes.get("/api/jobs")
+        async def get_jobs(request):
+            """List all jobs with filtering, sorting, and pagination.
+
+            Query parameters:
+                status: Filter by status (comma-separated): pending, in_progress, completed, failed
+                workflow_id: Filter by workflow ID
+                sort_by: Sort field: created_at (default), execution_duration
+                sort_order: Sort direction: asc, desc (default)
+                limit: Max items to return (positive integer)
+                offset: Items to skip (non-negative integer, default 0)
+            """
+            query = request.rel_url.query
+
+            status_param = query.get('status')
+            workflow_id = query.get('workflow_id')
+            sort_by = query.get('sort_by', 'created_at').lower()
+            sort_order = query.get('sort_order', 'desc').lower()
+
+            status_filter = None
+            if status_param:
+                status_filter = [s.strip().lower() for s in status_param.split(',') if s.strip()]
+                invalid_statuses = [s for s in status_filter if s not in JobStatus.ALL]
+                if invalid_statuses:
+                    return web.json_response(
+                        {"error": f"Invalid status value(s): {', '.join(invalid_statuses)}. Valid values: {', '.join(JobStatus.ALL)}"},
+                        status=400
+                    )
+
+            if sort_by not in {'created_at', 'execution_duration'}:
+                return web.json_response(
+                    {"error": "sort_by must be 'created_at' or 'execution_duration'"},
+                    status=400
+                )
+
+            if sort_order not in {'asc', 'desc'}:
+                return web.json_response(
+                    {"error": "sort_order must be 'asc' or 'desc'"},
+                    status=400
+                )
+
+            limit = None
+
+            # If limit is provided, validate that it is a positive integer, else continue without a limit
+            if 'limit' in query:
+                try:
+                    limit = int(query.get('limit'))
+                    if limit <= 0:
+                        return web.json_response(
+                            {"error": "limit must be a positive integer"},
+                            status=400
+                        )
+                except (ValueError, TypeError):
+                    return web.json_response(
+                        {"error": "limit must be an integer"},
+                        status=400
+                    )
+
+            offset = 0
+            if 'offset' in query:
+                try:
+                    offset = int(query.get('offset'))
+                    if offset < 0:
+                        offset = 0
+                except (ValueError, TypeError):
+                    return web.json_response(
+                        {"error": "offset must be an integer"},
+                        status=400
+                    )
+
+            running, queued = self.prompt_queue.get_current_queue_volatile()
+            history = self.prompt_queue.get_history()
+
+            running = _remove_sensitive_from_queue(running)
+            queued = _remove_sensitive_from_queue(queued)
+
+            jobs, total = get_all_jobs(
+                running, queued, history,
+                status_filter=status_filter,
+                workflow_id=workflow_id,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                limit=limit,
+                offset=offset
+            )
+
+            has_more = (offset + len(jobs)) < total
+
+            return web.json_response({
+                'jobs': jobs,
+                'pagination': {
+                    'offset': offset,
+                    'limit': limit,
+                    'total': total,
+                    'has_more': has_more
+                }
+            })
+
+        @routes.get("/api/jobs/{job_id}")
+        async def get_job_by_id(request):
+            """Get a single job by ID."""
+            job_id = request.match_info.get("job_id", None)
+            if not job_id:
+                return web.json_response(
+                    {"error": "job_id is required"},
+                    status=400
+                )
+
+            running, queued = self.prompt_queue.get_current_queue_volatile()
+            history = self.prompt_queue.get_history(prompt_id=job_id)
+
+            running = _remove_sensitive_from_queue(running)
+            queued = _remove_sensitive_from_queue(queued)
+
+            job = get_job(job_id, running, queued, history)
+            if job is None:
+                return web.json_response(
+                    {"error": "Job not found"},
+                    status=404
+                )
+
+            return web.json_response(job)
+
+        def _cancel_job_by_id(job_id):
+            """Cancel a single job by id using the queue's existing mechanics.
+
+            Running jobs are interrupted (same mechanism as /interrupt); pending
+            jobs are dequeued (same mechanism as /queue {"delete": [...]}).
+            Already-finished or unknown ids are no-ops. State-agnostic.
+
+            Returns True when a cancel was actually dispatched (running or
+            pending job), False when the call was a no-op (terminal/unknown id).
+            """
+            running, queued = self.prompt_queue.get_current_queue()
+            history = self.prompt_queue.get_history()
+
+            def interrupt(prompt_id):
+                logging.info(f"Cancelling running prompt {prompt_id}")
+                # Atomic: only interrupts if the job is still the one running,
+                # so a cancel can't land on a prompt that started in the gap
+                # since the snapshot above. Returns whether it actually fired.
+                return self.prompt_queue.interrupt_if_running(prompt_id)
+
+            def dequeue(prompt_id):
+                logging.info(f"Cancelling pending prompt {prompt_id}")
+                return self.prompt_queue.delete_queue_item(lambda a: a[1] == prompt_id)
+
+            classification = cancel_job(job_id, running, queued, history, interrupt, dequeue)
+            return classification in (CANCEL_RUNNING, CANCEL_PENDING)
+
+        @routes.post("/api/jobs/{job_id}/cancel")
+        async def cancel_job_by_id(request):
+            """Cancel a single job by id, regardless of state.
+
+            Idempotent: cancelling a job that has already finished, or an id
+            that is not known, returns 200 with {"cancelled": false} rather
+            than an error.
+            """
+            job_id = request.match_info.get("job_id", None)
+            if not job_id:
+                return web.json_response(
+                    {"error": "job_id is required"},
+                    status=400
+                )
+
+            cancelled = _cancel_job_by_id(job_id)
+            return web.json_response({"cancelled": cancelled})
+
+        @routes.post("/api/jobs/cancel")
+        async def cancel_jobs_batch(request):
+            """Cancel a batch of jobs by id.
+
+            Body: {"job_ids": ["<uuid>", ...]}
+
+            Best-effort and idempotent: every well-formed id is cancelled if it
+            is running or pending; ids that are already finished or unknown are
+            no-ops, not errors. A batch of all no-ops still returns 200 with
+            {"cancelled": false}. This matches the single-cancel endpoint and
+            means "cancel all" still cancels the in-progress jobs even if some
+            finished between the client's snapshot and the request. Malformed
+            ids are still rejected up front with 400 (see below).
+            """
+            try:
+                json_data = await request.json()
+            except json.JSONDecodeError:
+                return web.json_response(
+                    {"error": "Request body must be valid JSON"},
+                    status=400
+                )
+
+            job_ids = json_data.get("job_ids") if isinstance(json_data, dict) else None
+            if not isinstance(job_ids, list):
+                return web.json_response(
+                    {"error": "job_ids must be a list"},
+                    status=400
+                )
+
+            # Validate that every element is a well-formed job id before doing
+            # anything else.  An unhashable element (e.g. a nested dict or list)
+            # would cause a TypeError when used as a history dict key; a
+            # non-string or non-UUID value is never a valid id.  Reject early
+            # with 400 rather than letting the classify loop raise 500.
+            invalid_ids = []
+            for jid in job_ids:
+                try:
+                    validate_job_id(jid)
+                except (ValueError, AttributeError):
+                    invalid_ids.append(jid if isinstance(jid, str) else repr(jid))
+            if invalid_ids:
+                return web.json_response(
+                    {"error": "job_ids contains invalid id(s)", "invalid_ids": invalid_ids},
+                    status=400,
+                )
+
+            # Best-effort: cancel each id that is still running/pending; an id
+            # that has finished or never existed is a no-op rather than a reason
+            # to fail the whole batch.
+            cancelled = False
+            for jid in job_ids:
+                if _cancel_job_by_id(jid):
+                    cancelled = True
+
+            return web.json_response({"cancelled": cancelled})
 
         @routes.get("/history")
         async def get_history(request):
@@ -691,9 +1131,8 @@ class PromptServer():
         async def get_queue(request):
             queue_info = {}
             current_queue = self.prompt_queue.get_current_queue_volatile()
-            remove_sensitive = lambda queue: [x[:5] for x in queue]
-            queue_info['queue_running'] = remove_sensitive(current_queue[0])
-            queue_info['queue_pending'] = remove_sensitive(current_queue[1])
+            queue_info['queue_running'] = _remove_sensitive_from_queue(current_queue[0])
+            queue_info['queue_pending'] = _remove_sensitive_from_queue(current_queue[1])
             return web.json_response(queue_info)
 
         @routes.post("/prompt")
@@ -714,11 +1153,27 @@ class PromptServer():
 
             if "prompt" in json_data:
                 prompt = json_data["prompt"]
-                prompt_id = str(json_data.get("prompt_id", uuid.uuid4()))
+                client_prompt_id = json_data.get("prompt_id")
+                if client_prompt_id is None:
+                    # Absent or explicit null: the server mints the id.
+                    prompt_id = str(uuid.uuid4())
+                else:
+                    try:
+                        prompt_id = validate_job_id(client_prompt_id)
+                    except ValueError:
+                        error = {
+                            "type": "invalid_prompt_id",
+                            "message": "prompt_id must be a valid UUID",
+                            "details": "prompt_id must be a UUID string in canonical lowercase hyphenated form; omit it to let the server generate one",
+                            "extra_info": {}
+                        }
+                        return web.json_response({"error": error, "node_errors": {}}, status=400)
 
                 partial_execution_targets = None
                 if "partial_execution_targets" in json_data:
                     partial_execution_targets = json_data["partial_execution_targets"]
+
+                self.node_replace_manager.apply_replacements(prompt)
 
                 valid = await execution.validate_prompt(prompt_id, prompt, partial_execution_targets)
                 extra_data = {}
@@ -727,12 +1182,25 @@ class PromptServer():
 
                 if "client_id" in json_data:
                     extra_data["client_id"] = json_data["client_id"]
+
+                extra_data.pop("workflow_metadata", None)
+                metadata = valid_workflow_metadata(json_data)
+                if metadata is None:
+                    metadata = workflow_metadata_from_prompt(extra_data)
+                if metadata is not None:
+                    extra_data["workflow_metadata"] = metadata
+
+                if "comfy_usage_source" not in extra_data:
+                    usage_source = request.headers.get("Comfy-Usage-Source")
+                    if usage_source:
+                        extra_data["comfy_usage_source"] = usage_source
                 if valid[0]:
                     outputs_to_execute = valid[2]
                     sensitive = {}
                     for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:
                         if sensitive_val in extra_data:
                             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
+                    extra_data["create_time"] = int(time.time() * 1000)  # timestamp in milliseconds
                     self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
                     response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
                     return web.json_response(response)
@@ -827,6 +1295,7 @@ class PromptServer():
         self.model_file_manager.add_routes(self.routes)
         self.custom_node_manager.add_routes(self.routes, self.app, nodes.LOADED_MODULE_DIRS.items())
         self.subgraph_manager.add_routes(self.routes, nodes.LOADED_MODULE_DIRS.items())
+        self.node_replace_manager.add_routes(self.routes)
         self.app.add_subapp('/internal', self.internal_routes.get_app())
 
         # Prefix every route with /api for easier matching for delegation.
@@ -847,11 +1316,31 @@ class PromptServer():
         for name, dir in nodes.EXTENSION_WEB_DIRS.items():
             self.app.add_routes([web.static('/extensions/' + name, dir)])
 
-        workflow_templates_path = FrontendManager.templates_path()
-        if workflow_templates_path:
-            self.app.add_routes([
-                web.static('/templates', workflow_templates_path)
-            ])
+        installed_templates_version = FrontendManager.get_installed_templates_version()
+        use_legacy_templates = True
+        if installed_templates_version:
+            try:
+                use_legacy_templates = (
+                    parse_version(installed_templates_version)
+                    < parse_version("0.3.0")
+                )
+            except Exception as exc:
+                logging.warning(
+                    "Unable to parse templates version '%s': %s",
+                    installed_templates_version,
+                    exc,
+                )
+
+        if use_legacy_templates:
+            workflow_templates_path = FrontendManager.legacy_templates_path()
+            if workflow_templates_path:
+                self.app.add_routes([
+                    web.static('/templates', workflow_templates_path)
+                ])
+        else:
+            handler = FrontendManager.template_asset_handler()
+            if handler:
+                self.app.router.add_get("/templates/{path:.*}", handler)
 
         # Serve embedded documentation from the package
         embedded_docs_path = FrontendManager.embedded_docs_path()
@@ -974,6 +1463,22 @@ class PromptServer():
             await send_socket_catch_exception(self.sockets[sid].send_json, message)
 
     def send_sync(self, event, data, sid=None):
+        if self.workflow_metadata:
+            if isinstance(data, dict) and "prompt_id" in data:
+                data = {**self.workflow_metadata, **data}
+            elif (
+                event == BinaryEventTypes.PREVIEW_IMAGE_WITH_METADATA
+                and isinstance(data, tuple)
+                and len(data) == 2
+                and isinstance(data[1], dict)
+                and "prompt_id" in data[1]
+            ):
+                # Merged here rather than at publication: messages wait in the
+                # queue, so by the time publish_loop sends a preview the next
+                # prompt may already have replaced workflow_metadata, and the
+                # frame would carry the wrong workflow.
+                data = (data[0], {**self.workflow_metadata, **data[1]})
+
         self.loop.call_soon_threadsafe(
             self.messages.put_nowait, (event, data, sid))
 
@@ -1001,11 +1506,26 @@ class PromptServer():
 
         if verbose:
             logging.info("Starting server\n")
+            if args.debug_hang:
+                logging.info(
+                    f"{'-' * 80}\n"
+                    "ComfyUI has been started in debug-hang mode. Run your workflow as normal up to\n"
+                    "the point of the hang or freeze, then use ctrl-C in the cmd or controlling\n"
+                    "terminal to dump the python backtraces for debugging. Please attach the extra\n"
+                    "debug info to your bug report.\n"
+                    f"{'-' * 80}"
+                )
         for addr in addresses:
             address = addr[0]
             port = addr[1]
             site = web.TCPSite(runner, address, port, ssl_context=ssl_ctx)
-            await site.start()
+            try:
+                await site.start()
+            except OSError as e:
+                if e.errno == errno.EADDRINUSE:
+                    logging.error(f"Port {port} is already in use on address {address}. Please close the other application or use a different port with --port.")
+                    raise SystemExit(1)
+                raise
 
             if not hasattr(self, 'address'):
                 self.address = address #TODO: remove this
