@@ -1,0 +1,216 @@
+{
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "flux1-dev-Q5_K_S.gguf"
+    }
+  },
+  "11": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "lora_name": "boreal-v2.safetensors",
+      "strength_model": 0.65
+    }
+  },
+  "2": {
+    "class_type": "DualCLIPLoaderGGUF",
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "t5-v1_1-xxl-encoder-Q5_K_M.gguf",
+      "type": "flux"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "phone photo, close-up front camera selfie of a 24-year-old Costa Rican woman sitting in the passenger seat of a car, head slightly tilted, face filling most of the frame. Long straight black hair tucked behind her ears, both earlobes visible, each earlobe pierced by a small gold hoop earring hanging from the lobe. She smiles softly with her lips closed, a relaxed natural closed-mouth smile with soft pink lips. Raw unfiltered skin with visible pores and light freckles. Light gray ribbed tank top. Through the car window behind her: a rural road in Costa Rica with banana plants, a small colorful house and an old red pickup truck parked at the roadside. Warm afternoon daylight from the window. iPhone front camera, sharp detail on her face, natural sensor noise, unedited. instagram photo from 2023.",
+      "clip": [
+        "2",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "FluxGuidance",
+    "inputs": {
+      "conditioning": [
+        "4",
+        0
+      ],
+      "guidance": 2.0
+    }
+  },
+  "8": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "34",
+        0
+      ],
+      "guider": [
+        "33",
+        0
+      ],
+      "sampler": [
+        "31",
+        0
+      ],
+      "sigmas": [
+        "32",
+        0
+      ],
+      "latent_image": [
+        "24",
+        0
+      ]
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "8",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "10": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "25",
+        0
+      ],
+      "filename_prefix": "gabi01_fix3"
+    }
+  },
+  "20": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "gabi01_v2.png"
+    }
+  },
+  "22": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "20",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "30": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "31": {
+    "class_type": "DetailDaemonSamplerNode",
+    "inputs": {
+      "sampler": [
+        "30",
+        0
+      ],
+      "detail_amount": 1.0,
+      "start": 0.0,
+      "end": 0.9,
+      "bias": 0.5,
+      "exponent": 0.25,
+      "start_offset": 0.0,
+      "end_offset": 0.0,
+      "fade": 0.0,
+      "smooth": true,
+      "cfg_scale_override": 0.0
+    }
+  },
+  "32": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": [
+        "11",
+        0
+      ],
+      "scheduler": "simple",
+      "steps": 12,
+      "denoise": 0.8
+    }
+  },
+  "33": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": [
+        "11",
+        0
+      ],
+      "conditioning": [
+        "5",
+        0
+      ]
+    }
+  },
+  "34": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 0
+    }
+  },
+  "23": {
+    "class_type": "LoadImageMask",
+    "inputs": {
+      "image": "gabi01_fix3_mask.png",
+      "channel": "red"
+    }
+  },
+  "24": {
+    "class_type": "SetLatentNoiseMask",
+    "inputs": {
+      "samples": [
+        "22",
+        0
+      ],
+      "mask": [
+        "23",
+        0
+      ]
+    }
+  },
+  "25": {
+    "class_type": "ImageCompositeMasked",
+    "inputs": {
+      "destination": [
+        "20",
+        0
+      ],
+      "source": [
+        "9",
+        0
+      ],
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "mask": [
+        "23",
+        0
+      ]
+    }
+  }
+}

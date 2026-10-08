@@ -1,0 +1,243 @@
+{
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "flux1-dev-Q5_K_S.gguf"
+    }
+  },
+  "11": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "lora_name": "boreal-v2.safetensors",
+      "strength_model": 0.65
+    }
+  },
+  "2": {
+    "class_type": "DualCLIPLoaderGGUF",
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "t5-v1_1-xxl-encoder-Q5_K_M.gguf",
+      "type": "flux"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "close-up detail of a phone photo of a young Costa Rican woman: long straight dark brown hair falls beside her jaw, and the lower part of her right ear peeks out from behind the hair, the soft earlobe visible with a thin gold hoop earring passing through the pierced earlobe and hanging down. Warm light-brown skin of her jaw and cheek, natural skin texture. Warm afternoon daylight. iPhone front camera, natural sensor noise.",
+      "clip": [
+        "2",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "FluxGuidance",
+    "inputs": {
+      "conditioning": [
+        "4",
+        0
+      ],
+      "guidance": 2.0
+    }
+  },
+  "8": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "34",
+        0
+      ],
+      "guider": [
+        "33",
+        0
+      ],
+      "sampler": [
+        "30",
+        0
+      ],
+      "sigmas": [
+        "32",
+        0
+      ],
+      "latent_image": [
+        "24",
+        0
+      ]
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "8",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "10": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "25",
+        0
+      ],
+      "filename_prefix": "gabi01_fix5"
+    }
+  },
+  "20": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "gabi01_fix3b.png"
+    }
+  },
+  "22": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "41",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "30": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "32": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": [
+        "11",
+        0
+      ],
+      "scheduler": "simple",
+      "steps": 12,
+      "denoise": 0.7
+    }
+  },
+  "33": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": [
+        "11",
+        0
+      ],
+      "conditioning": [
+        "5",
+        0
+      ]
+    }
+  },
+  "34": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 0
+    }
+  },
+  "23": {
+    "class_type": "LoadImageMask",
+    "inputs": {
+      "image": "gabi01_ear_mask_768.png",
+      "channel": "red"
+    }
+  },
+  "24": {
+    "class_type": "SetLatentNoiseMask",
+    "inputs": {
+      "samples": [
+        "22",
+        0
+      ],
+      "mask": [
+        "23",
+        0
+      ]
+    }
+  },
+  "25": {
+    "class_type": "ImageCompositeMasked",
+    "inputs": {
+      "destination": [
+        "20",
+        0
+      ],
+      "source": [
+        "42",
+        0
+      ],
+      "x": 372,
+      "y": 772,
+      "resize_source": false,
+      "mask": [
+        "43",
+        0
+      ]
+    }
+  },
+  "40": {
+    "class_type": "ImageCrop",
+    "inputs": {
+      "image": [
+        "20",
+        0
+      ],
+      "width": 256,
+      "height": 256,
+      "x": 372,
+      "y": 772
+    }
+  },
+  "41": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "40",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "width": 768,
+      "height": 768,
+      "crop": "disabled"
+    }
+  },
+  "42": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "9",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "width": 256,
+      "height": 256,
+      "crop": "disabled"
+    }
+  },
+  "43": {
+    "class_type": "LoadImageMask",
+    "inputs": {
+      "image": "gabi01_ear_mask_256.png",
+      "channel": "red"
+    }
+  }
+}
